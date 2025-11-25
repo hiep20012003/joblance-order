@@ -1,3 +1,6 @@
+import * as fs from 'node:fs/promises';
+import path from 'path';
+
 import { Request, Response } from 'express';
 import { v4 as uuidv4 } from 'uuid';
 import { faker } from '@faker-js/faker';
@@ -17,6 +20,16 @@ import { PaymentModel } from '../database/models/payment.model';
 import { AppLogger } from '../utils/logger';
 import { generateInvoiceId } from '../utils/helper';
 
+function getRandomItem(arr: any) {
+  // get random index value
+  const randomIndex = Math.floor(Math.random() * arr.length);
+
+  // get random item
+  const item = arr[randomIndex];
+
+  return item;
+}
+
 function biasReview(options: any) {
   const defaultWeights = [5, 10, 15, 30, 40]; // 1★ → 5★
   const weights = options?.weights || defaultWeights;
@@ -34,6 +47,26 @@ export const seedOrders = async (req: Request, res: Response) => {
   const operation = 'seedOrders';
 
   try {
+    const reviewForBuyerDataText = await fs.readFile(
+      path.join(__dirname, '../seed/review-for-buyer.txt'),
+      'utf8'
+    );
+      
+    const reviewForSellerDataText = await fs.readFile(
+      path.join(__dirname, '../seed/review-for-seller.txt'),
+      'utf8'
+    );
+
+    const reviewForBuyerData = reviewForBuyerDataText
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
+    const reviewForSellerData = reviewForSellerDataText
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+
     const { buyers, sellers, gigs } = req.body as {
       buyers: Required<IBuyerDocument>[];
       sellers: Required<ISellerDocument>[];
@@ -44,16 +77,21 @@ export const seedOrders = async (req: Request, res: Response) => {
       return res.status(400).json({ message: 'Buyers, sellers, and gigs must be provided' });
     }
 
-    const ordersToInsert: any[] = [];
-    const paymentsToInsert: any[] = [];
-    const negotiationsToInsert: any[] = [];
+    let ordersToInsertCount = 0;
+    let paymentsToInsertCount = 0;
+    let negotiationsToInsertCount = 0;
+    const completedOrders = [];
 
     // const eventsToPublish: ({ type: MessageQueueType, routingKey: string, payload: any })[] = [];
 
-    const pickRandomBuyer = (sellerId: string) => faker.helpers.arrayElement(buyers.filter(b => b._id !== sellerId));
-    const pickGigOfSeller = (sellerId: string) => faker.helpers.arrayElement(gigs.filter(g => g.sellerId === sellerId));
+    const pickRandomBuyer = (sellerId: string) => getRandomItem(buyers.filter(b => b._id !== sellerId));
+    const pickGigOfSeller = (sellerId: string) => getRandomItem(gigs.filter(g => g.sellerId === sellerId));
 
     for (const seller of sellers) {
+      const ordersToInsert: any[] = [];
+      const paymentsToInsert: any[] = [];
+      const negotiationsToInsert: any[] = [];
+
       const completedTarget = seller.completedJobs || 0;
       const ongoingTarget = seller.ongoingJobs || 0;
       const cancelledTarget = seller.cancelledJobs || 0;
@@ -188,7 +226,6 @@ export const seedOrders = async (req: Request, res: Response) => {
           order.status = OrderStatus.COMPLETED;
           order.approvedAt = approvedAt;
 
-          // === REVIEW: ĐA DẠNG NHƯ THỰC TẾ ===
           const hasBuyerReview = faker.datatype.boolean({ probability: 0.8 }); // 80% buyer để lại review
           const hasSellerReview = faker.datatype.boolean({ probability: 0.6 }); // 60% seller để lại review
 
@@ -201,7 +238,7 @@ export const seedOrders = async (req: Request, res: Response) => {
             order.buyerReview = {
               _id: uuidv4(),
               rating: buyerRating,
-              review: faker.lorem.sentence(),
+              review: getRandomItem(reviewForSellerData),
               timestamp: reviewAt,
             };
             order.events.push({ type: OrderEventType.BUYER_REVIEW, timestamp: reviewAt });
@@ -227,7 +264,7 @@ export const seedOrders = async (req: Request, res: Response) => {
             order.sellerReview = {
               _id: uuidv4(),
               rating: sellerRating,
-              review: faker.lorem.sentence(),
+              review: getRandomItem(reviewForBuyerData),
               timestamp: sellerReviewAt,
             };
             order.events.push({ type: OrderEventType.SELLER_REVIEW, timestamp: sellerReviewAt });
@@ -321,7 +358,6 @@ export const seedOrders = async (req: Request, res: Response) => {
                 order.currentNegotiationId = null;
                 order.timeRemainingBeforePause = null;
               }
-              // KHÔNG CÓ ACCEPTED Ở ĐÂY → DÀNH CHO BLOCK CANCELLED
             }
           }
 
@@ -351,7 +387,7 @@ export const seedOrders = async (req: Request, res: Response) => {
           assigned = true;
         }
 
-        // === 3. CANCELLED (DUY NHẤT ĐƯỢC TẠO Ở ĐÂY) ===
+        // === 3. CANCELLED ===
         if (!assigned && cancelledTarget > 0 && ordersToInsert.filter(o => o.sellerId === seller._id && o.status === OrderStatus.CANCELLED).length < cancelledTarget) {
           payment.status = PaymentStatus.PAID;
           order.status = OrderStatus.ACTIVE;
@@ -414,15 +450,29 @@ export const seedOrders = async (req: Request, res: Response) => {
 
         ordersToInsert.push(order);
         paymentsToInsert.push(payment);
+
+
       }
+
+      const createdOrders = await OrderModel.insertMany(ordersToInsert);
+      const createdPayments = await PaymentModel.insertMany(paymentsToInsert);
+      if (negotiationsToInsert.length > 0) {
+        await NegotiationModel.insertMany(negotiationsToInsert);
+        negotiationsToInsertCount += negotiationsToInsert.length;
+      }
+
+      ordersToInsertCount += createdOrders.length;
+      paymentsToInsertCount += createdPayments.length;
+
+      completedOrders.push(ordersToInsert.filter(o => o.status === OrderStatus.COMPLETED));
     }
 
     // Insert all
-    const createdOrders = await OrderModel.insertMany(ordersToInsert);
-    const createdPayments = await PaymentModel.insertMany(paymentsToInsert);
-    if (negotiationsToInsert.length > 0) {
-      await NegotiationModel.insertMany(negotiationsToInsert);
-    }
+    // const createdOrders = await OrderModel.insertMany(ordersToInsert);
+    // const createdPayments = await PaymentModel.insertMany(paymentsToInsert);
+    // if (negotiationsToInsert.length > 0) {
+    //   await NegotiationModel.insertMany(negotiationsToInsert);
+    // }
 
     // if (eventsToPublish.length > 0) {
     //   for (const event of eventsToPublish) {
@@ -441,18 +491,18 @@ export const seedOrders = async (req: Request, res: Response) => {
     //   }
     // }
 
-    AppLogger.info(`Seeded ${createdOrders.length} orders - 100% matched seller stats`, { operation });
+    AppLogger.info(`Seeded ${ordersToInsertCount} orders - 100% matched seller stats`, { operation });
     return res.status(201).json({
       message: 'Seeded successfully',
-      orders: createdOrders,
+      orders: completedOrders.flat(),
       counts: {
-        orders: createdOrders.length,
-        payments: createdPayments.length,
-        negotiations: negotiationsToInsert.length,
+        orders: ordersToInsertCount,
+        payments: paymentsToInsertCount,
+        negotiations: negotiationsToInsertCount,
       },
     });
   } catch (error: any) {
-    AppLogger.error('Seed failed', { operation, error: error.message });
+    AppLogger.error('Seed failed', { operation, error: error });
     return res.status(500).json({ message: 'Seed failed', error: error.message });
   }
 };
